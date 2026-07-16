@@ -153,7 +153,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = [version]'1.0.0'
+$script:ScriptVersion = [version]'1.0.1'
 $script:Repository = 'oguzhanf/logrhythm-to-sentinel-migration-helper'
 $script:SentinelApiVersion = '2025-09-01'
 $script:LogAnalyticsTablesApiVersion = '2023-09-01'
@@ -764,11 +764,14 @@ function Test-SchemaObject {
     param(
         [Parameter(Mandatory = $true)][System.Data.DataTable]$Schema,
         [Parameter(Mandatory = $true)][string]$TableName,
-        [string]$ColumnName
+        [string]$ColumnName,
+        [string]$SchemaName
     )
 
     foreach ($row in $Schema.Rows) {
-        if ([string]$row.TableName -ieq $TableName) {
+        if ([string]$row.TableName -ieq $TableName -and
+            ([string]::IsNullOrWhiteSpace($SchemaName) -or
+             [string]$row.SchemaName -ieq $SchemaName)) {
             if ([string]::IsNullOrWhiteSpace($ColumnName) -or
                 [string]$row.ColumnName -ieq $ColumnName) {
                 return $true
@@ -776,6 +779,44 @@ function Test-SchemaObject {
         }
     }
     return $false
+}
+
+function Resolve-SchemaTable {
+    param(
+        [Parameter(Mandatory = $true)][System.Data.DataTable]$Schema,
+        [Parameter(Mandatory = $true)][string[]]$TableNames
+    )
+
+    foreach ($tableName in $TableNames) {
+        $match = $null
+        foreach ($row in $Schema.Rows) {
+            if ([string]$row.TableName -ine $tableName) {
+                continue
+            }
+            if ($null -eq $match -or [string]$row.SchemaName -ieq 'dbo') {
+                $match = $row
+            }
+            if ([string]$row.SchemaName -ieq 'dbo') {
+                break
+            }
+        }
+        if ($null -ne $match) {
+            return [pscustomobject]@{
+                SchemaName = [string]$match.SchemaName
+                TableName  = [string]$match.TableName
+            }
+        }
+    }
+    return $null
+}
+
+function Get-QualifiedSqlName {
+    param(
+        [Parameter(Mandatory = $true)][string]$SchemaName,
+        [Parameter(Mandatory = $true)][string]$TableName
+    )
+
+    return '[{0}].[{1}]' -f $SchemaName.Replace(']', ']]'), $TableName.Replace(']', ']]')
 }
 
 function Get-XmlNodeValue {
@@ -926,48 +967,92 @@ ORDER BY s.name, t.name, c.column_id;
             Name = 'RelevantSchema'; Rows = $schema.Rows.Count; File = $schemaPath
         })
 
-        if (-not (Test-SchemaObject -Schema $schema -TableName 'LogSource')) {
-            throw "dbo.LogSource was not found. Review '$schemaPath' and the companion LogRhythm-Export.sql for this LogRhythm build."
+        $logSourceTable = Resolve-SchemaTable -Schema $schema -TableNames @('MsgSource', 'LogSource')
+        if ($null -eq $logSourceTable) {
+            throw "Neither MsgSource nor LogSource was found. Review '$schemaPath' and the companion LogRhythm-Export.sql for this LogRhythm build."
         }
+        $logSourceSqlName = Get-QualifiedSqlName `
+            -SchemaName $logSourceTable.SchemaName `
+            -TableName $logSourceTable.TableName
+        Write-Success (
+            "Using {0}.{1} for the log-source inventory." -f
+            $logSourceTable.SchemaName, $logSourceTable.TableName
+        )
+
+        $hostTable = Resolve-SchemaTable -Schema $schema -TableNames @('Host')
+        $entityTable = Resolve-SchemaTable -Schema $schema -TableNames @('Entity')
+        $typeTable = Resolve-SchemaTable -Schema $schema -TableNames @('MsgSourceType', 'LogSourceType')
 
         $hasHostJoin = (
-            (Test-SchemaObject -Schema $schema -TableName 'Host') -and
-            (Test-SchemaObject -Schema $schema -TableName 'LogSource' -ColumnName 'HostID') -and
-            (Test-SchemaObject -Schema $schema -TableName 'Host' -ColumnName 'HostID')
+            $null -ne $hostTable -and
+            (Test-SchemaObject -Schema $schema `
+                -SchemaName $logSourceTable.SchemaName `
+                -TableName $logSourceTable.TableName `
+                -ColumnName 'HostID') -and
+            (Test-SchemaObject -Schema $schema `
+                -SchemaName $hostTable.SchemaName `
+                -TableName $hostTable.TableName `
+                -ColumnName 'HostID')
         )
         $hasEntityJoin = (
             $hasHostJoin -and
-            (Test-SchemaObject -Schema $schema -TableName 'Entity') -and
-            (Test-SchemaObject -Schema $schema -TableName 'Host' -ColumnName 'EntityID') -and
-            (Test-SchemaObject -Schema $schema -TableName 'Entity' -ColumnName 'EntityID')
+            $null -ne $entityTable -and
+            (Test-SchemaObject -Schema $schema `
+                -SchemaName $hostTable.SchemaName `
+                -TableName $hostTable.TableName `
+                -ColumnName 'EntityID') -and
+            (Test-SchemaObject -Schema $schema `
+                -SchemaName $entityTable.SchemaName `
+                -TableName $entityTable.TableName `
+                -ColumnName 'EntityID')
         )
         $hasTypeJoin = (
-            (Test-SchemaObject -Schema $schema -TableName 'MsgSourceType') -and
-            (Test-SchemaObject -Schema $schema -TableName 'LogSource' -ColumnName 'MsgSourceTypeID') -and
-            (Test-SchemaObject -Schema $schema -TableName 'MsgSourceType' -ColumnName 'MsgSourceTypeID')
+            $null -ne $typeTable -and
+            (Test-SchemaObject -Schema $schema `
+                -SchemaName $logSourceTable.SchemaName `
+                -TableName $logSourceTable.TableName `
+                -ColumnName 'MsgSourceTypeID') -and
+            (Test-SchemaObject -Schema $schema `
+                -SchemaName $typeTable.SchemaName `
+                -TableName $typeTable.TableName `
+                -ColumnName 'MsgSourceTypeID')
         )
 
         $selectColumns = @()
         $joins = @()
         if ($hasEntityJoin) {
             $selectColumns += 'e.Name AS Entity'
-            $joins += 'LEFT JOIN dbo.Entity AS e ON h.EntityID = e.EntityID'
         }
         else {
             $selectColumns += 'CAST(NULL AS nvarchar(256)) AS Entity'
         }
         if ($hasHostJoin) {
             $selectColumns += 'h.Name AS HostName'
-            $joins = @('LEFT JOIN dbo.Host AS h ON ls.HostID = h.HostID') + $joins
+            $hostSqlName = Get-QualifiedSqlName `
+                -SchemaName $hostTable.SchemaName `
+                -TableName $hostTable.TableName
+            $joins += "LEFT JOIN $hostSqlName AS h ON ls.HostID = h.HostID"
         }
         else {
             $selectColumns += 'CAST(NULL AS nvarchar(256)) AS HostName'
         }
+        if ($hasEntityJoin) {
+            $entitySqlName = Get-QualifiedSqlName `
+                -SchemaName $entityTable.SchemaName `
+                -TableName $entityTable.TableName
+            $joins += "LEFT JOIN $entitySqlName AS e ON h.EntityID = e.EntityID"
+        }
         if ($hasTypeJoin) {
             $selectColumns += 'mst.Name AS LogSourceType'
-            $joins += 'LEFT JOIN dbo.MsgSourceType AS mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID'
+            $typeSqlName = Get-QualifiedSqlName `
+                -SchemaName $typeTable.SchemaName `
+                -TableName $typeTable.TableName
+            $joins += "LEFT JOIN $typeSqlName AS mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID"
         }
-        elseif (Test-SchemaObject -Schema $schema -TableName 'LogSource' -ColumnName 'MsgSourceTypeID') {
+        elseif (Test-SchemaObject -Schema $schema `
+                -SchemaName $logSourceTable.SchemaName `
+                -TableName $logSourceTable.TableName `
+                -ColumnName 'MsgSourceTypeID') {
             $selectColumns += 'CONVERT(nvarchar(64), ls.MsgSourceTypeID) AS LogSourceType'
         }
         else {
@@ -975,7 +1060,7 @@ ORDER BY s.name, t.name, c.column_id;
         }
         $selectColumns += 'ls.*'
 
-        $logSourceQuery = "SELECT`n    $($selectColumns -join ",`n    ")`nFROM dbo.LogSource AS ls`n$($joins -join "`n");"
+        $logSourceQuery = "SELECT`n    $($selectColumns -join ",`n    ")`nFROM $logSourceSqlName AS ls`n$($joins -join "`n");"
         $logSources = Invoke-SqlDataTable -Connection $connection -Query $logSourceQuery
         $logSourcesPath = Join-Path $paths.LogRhythm 'LogSources.csv'
         Export-DataTable -Table $logSources -Path $logSourcesPath
@@ -984,28 +1069,31 @@ ORDER BY s.name, t.name, c.column_id;
         })
 
         if ($hasTypeJoin) {
-            $typeQuery = @'
+            $typeQuery = @"
 SELECT
     COALESCE(mst.Name, '(Unknown)') AS LogSourceType,
     COUNT_BIG(*) AS LogSourceCount
-FROM dbo.LogSource AS ls
-LEFT JOIN dbo.MsgSourceType AS mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID
+FROM $logSourceSqlName AS ls
+LEFT JOIN $typeSqlName AS mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID
 GROUP BY COALESCE(mst.Name, '(Unknown)')
 ORDER BY COUNT_BIG(*) DESC, COALESCE(mst.Name, '(Unknown)');
-'@
+"@
         }
-        elseif (Test-SchemaObject -Schema $schema -TableName 'LogSource' -ColumnName 'MsgSourceTypeID') {
-            $typeQuery = @'
+        elseif (Test-SchemaObject -Schema $schema `
+                -SchemaName $logSourceTable.SchemaName `
+                -TableName $logSourceTable.TableName `
+                -ColumnName 'MsgSourceTypeID') {
+            $typeQuery = @"
 SELECT
     CONVERT(nvarchar(64), MsgSourceTypeID) AS LogSourceType,
     COUNT_BIG(*) AS LogSourceCount
-FROM dbo.LogSource
+FROM $logSourceSqlName
 GROUP BY MsgSourceTypeID
 ORDER BY COUNT_BIG(*) DESC, MsgSourceTypeID;
-'@
+"@
         }
         else {
-            $typeQuery = "SELECT CAST('(Unknown)' AS nvarchar(64)) AS LogSourceType, COUNT_BIG(*) AS LogSourceCount FROM dbo.LogSource;"
+            $typeQuery = "SELECT CAST('(Unknown)' AS nvarchar(64)) AS LogSourceType, COUNT_BIG(*) AS LogSourceCount FROM $logSourceSqlName;"
         }
         $sourceTypes = Invoke-SqlDataTable -Connection $connection -Query $typeQuery
         $sourceTypesPath = Join-Path $paths.LogRhythm 'LogSourceTypes.csv'
@@ -1015,14 +1103,22 @@ ORDER BY COUNT_BIG(*) DESC, MsgSourceTypeID;
         })
 
         foreach ($optionalExport in @(
-            [pscustomobject]@{ Name = 'Entities'; Table = 'Entity'; Query = 'SELECT * FROM dbo.Entity;' },
-            [pscustomobject]@{ Name = 'Hosts'; Table = 'Host'; Query = 'SELECT * FROM dbo.Host;' },
-            [pscustomobject]@{ Name = 'MessageSourceTypes'; Table = 'MsgSourceType'; Query = 'SELECT * FROM dbo.MsgSourceType;' },
-            [pscustomobject]@{ Name = 'AIERules'; Table = 'AIERule'; Query = 'SELECT * FROM dbo.AIERule;' },
-            [pscustomobject]@{ Name = 'AlarmRules'; Table = 'AlarmRule'; Query = 'SELECT * FROM dbo.AlarmRule;' }
+            [pscustomobject]@{ Name = 'Entities'; Table = 'Entity' },
+            [pscustomobject]@{ Name = 'Hosts'; Table = 'Host' },
+            [pscustomobject]@{ Name = 'MessageSourceTypes'; Table = 'MsgSourceType' },
+            [pscustomobject]@{ Name = 'AIERules'; Table = 'AIERule' },
+            [pscustomobject]@{ Name = 'AlarmRules'; Table = 'AlarmRule' }
         )) {
-            if (Test-SchemaObject -Schema $schema -TableName $optionalExport.Table) {
-                $table = Invoke-SqlDataTable -Connection $connection -Query $optionalExport.Query
+            $optionalTable = Resolve-SchemaTable `
+                -Schema $schema `
+                -TableNames @($optionalExport.Table)
+            if ($null -ne $optionalTable) {
+                $optionalSqlName = Get-QualifiedSqlName `
+                    -SchemaName $optionalTable.SchemaName `
+                    -TableName $optionalTable.TableName
+                $table = Invoke-SqlDataTable `
+                    -Connection $connection `
+                    -Query "SELECT * FROM $optionalSqlName;"
                 $file = Join-Path $paths.LogRhythm ($optionalExport.Name + '.csv')
                 Export-DataTable -Table $table -Path $file
                 $exportResults.Add([pscustomobject]@{
@@ -1031,7 +1127,7 @@ ORDER BY COUNT_BIG(*) DESC, MsgSourceTypeID;
             }
             else {
                 $missingOptional.Add($optionalExport.Table)
-                Write-Notice "Optional table dbo.$($optionalExport.Table) was not found."
+                Write-Notice "Optional table $($optionalExport.Table) was not found."
             }
         }
     }
@@ -1074,6 +1170,7 @@ ORDER BY COUNT_BIG(*) DESC, MsgSourceTypeID;
         Authentication     = if ($SqlAuthentication) { 'SQL credential' } else { 'Windows integrated' }
         Encrypted          = $Encrypt
         TrustedCertificate = [bool]$TrustCertificate
+        LogSourceObject    = "$($logSourceTable.SchemaName).$($logSourceTable.TableName)"
         OptionalTablesNotFound = $missingOptional.ToArray()
         Files              = $files
     }
@@ -2461,6 +2558,42 @@ function Invoke-MigrationSelfTest {
         finally {
             $credentialConnection.Dispose()
         }
+
+        $testSchema = New-Object System.Data.DataTable
+        [void]$testSchema.Columns.Add('SchemaName', [string])
+        [void]$testSchema.Columns.Add('TableName', [string])
+        [void]$testSchema.Columns.Add('ColumnName', [string])
+        foreach ($schemaRow in @(
+            [pscustomobject]@{ SchemaName = 'archive'; TableName = 'MsgSource'; ColumnName = 'HostID' },
+            [pscustomobject]@{ SchemaName = 'dbo'; TableName = 'MsgSource'; ColumnName = 'HostID' },
+            [pscustomobject]@{ SchemaName = 'dbo'; TableName = 'MsgSource'; ColumnName = 'MsgSourceTypeID' },
+            [pscustomobject]@{ SchemaName = 'dbo'; TableName = 'LogSource'; ColumnName = 'HostID' }
+        )) {
+            $row = $testSchema.NewRow()
+            $row.SchemaName = $schemaRow.SchemaName
+            $row.TableName = $schemaRow.TableName
+            $row.ColumnName = $schemaRow.ColumnName
+            [void]$testSchema.Rows.Add($row)
+        }
+        $resolvedSource = Resolve-SchemaTable `
+            -Schema $testSchema `
+            -TableNames @('MsgSource', 'LogSource')
+        Assert-Condition (
+            $resolvedSource.SchemaName -eq 'dbo' -and
+            $resolvedSource.TableName -eq 'MsgSource'
+        ) 'MsgSource schema discovery failed.'
+        Assert-Condition (
+            (Get-QualifiedSqlName `
+                -SchemaName $resolvedSource.SchemaName `
+                -TableName $resolvedSource.TableName) -eq '[dbo].[MsgSource]'
+        ) 'qualified SQL object construction failed.'
+        Assert-Condition (
+            (Test-SchemaObject `
+                -Schema $testSchema `
+                -SchemaName 'dbo' `
+                -TableName 'MsgSource' `
+                -ColumnName 'MsgSourceTypeID')
+        ) 'schema-specific column discovery failed.'
 
         $paths = Initialize-MigrationPaths -Root $testRoot
         Export-CsvFile -InputObject @(

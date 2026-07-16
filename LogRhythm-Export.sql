@@ -116,7 +116,7 @@ FROM      sys.tables  t
 JOIN      sys.columns c  ON t.object_id    = c.object_id
 JOIN      sys.types   tp ON c.user_type_id = tp.user_type_id
 WHERE t.name IN (
-    'Entity', 'Host', 'LogSource', 'MsgSourceType',
+    'Entity', 'Host', 'MsgSource', 'LogSource', 'MsgSourceType',
     'AIERule', 'AlarmRule', 'MPERule', 'Network',
     'SystemMonitorPolicy', 'LogSourceVirtualSource'
 )
@@ -173,16 +173,32 @@ GO
 PRINT '';
 PRINT 'Section 3: Log Source Inventory';
 
-SELECT
-    e.Name   AS Entity,
-    h.Name   AS HostName,
-    mst.Name AS LogSourceType,
-    ls.*
-FROM       dbo.LogSource      ls
-LEFT JOIN  dbo.Host          h   ON ls.HostID          = h.HostID
-LEFT JOIN  dbo.Entity        e   ON h.EntityID         = e.EntityID
-LEFT JOIN  dbo.MsgSourceType mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID
-ORDER BY mst.Name, e.Name, h.Name;
+DECLARE @LogSourceObject nvarchar(517) =
+    CASE
+        WHEN OBJECT_ID(N'dbo.MsgSource', N'U') IS NOT NULL
+            THEN N'[dbo].[MsgSource]'
+        WHEN OBJECT_ID(N'dbo.LogSource', N'U') IS NOT NULL
+            THEN N'[dbo].[LogSource]'
+        ELSE NULL
+    END;
+
+IF @LogSourceObject IS NULL
+    PRINT 'NOTICE: Neither dbo.MsgSource nor dbo.LogSource was found. Check Section 0 results.';
+ELSE
+BEGIN
+    DECLARE @LogSourceSql nvarchar(max) = N'
+        SELECT
+            e.Name   AS Entity,
+            h.Name   AS HostName,
+            mst.Name AS LogSourceType,
+            ls.*
+        FROM ' + @LogSourceObject + N' AS ls
+        LEFT JOIN dbo.Host          AS h   ON ls.HostID          = h.HostID
+        LEFT JOIN dbo.Entity        AS e   ON h.EntityID         = e.EntityID
+        LEFT JOIN dbo.MsgSourceType AS mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID
+        ORDER BY mst.Name, e.Name, h.Name;';
+    EXEC sys.sp_executesql @LogSourceSql;
+END;
 GO
 
 
@@ -195,13 +211,29 @@ GO
 PRINT '';
 PRINT 'Section 4: Log Source Type Counts';
 
-SELECT
-    mst.Name    AS LogSourceType,
-    COUNT(*)    AS LogSourceCount
-FROM       dbo.LogSource      ls
-LEFT JOIN  dbo.MsgSourceType mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID
-GROUP BY   mst.Name
-ORDER BY   COUNT(*) DESC;
+DECLARE @LogSourceObject nvarchar(517) =
+    CASE
+        WHEN OBJECT_ID(N'dbo.MsgSource', N'U') IS NOT NULL
+            THEN N'[dbo].[MsgSource]'
+        WHEN OBJECT_ID(N'dbo.LogSource', N'U') IS NOT NULL
+            THEN N'[dbo].[LogSource]'
+        ELSE NULL
+    END;
+
+IF @LogSourceObject IS NULL
+    PRINT 'NOTICE: Neither dbo.MsgSource nor dbo.LogSource was found. Check Section 0 results.';
+ELSE
+BEGIN
+    DECLARE @LogSourceSql nvarchar(max) = N'
+        SELECT
+            mst.Name AS LogSourceType,
+            COUNT(*) AS LogSourceCount
+        FROM ' + @LogSourceObject + N' AS ls
+        LEFT JOIN dbo.MsgSourceType AS mst ON ls.MsgSourceTypeID = mst.MsgSourceTypeID
+        GROUP BY mst.Name
+        ORDER BY COUNT(*) DESC;';
+    EXEC sys.sp_executesql @LogSourceSql;
+END;
 GO
 
 
